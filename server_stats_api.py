@@ -1,0 +1,375 @@
+import os
+import psutil
+import time
+import sqlite3
+import asyncio
+import copy
+import re
+import requests
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+
+SERVER_START_TIME = time.time()
+app = FastAPI(title="Advanced Server Stats API")
+
+REQUIRE_AUTH = False
+API_KEY = "your_super_secret_token_here"
+API_KEY_NAME = "X-Server-Token"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "power_tracker.db")
+ELECTRICITY_RATE_PER_KWH = 0.13  
+BACKGROUND_INTERVAL_SECONDS = 5  
+VLLM_METRICS_URL = "http://localhost:8000/metrics"
+
+
+# Global persistent database connection reference
+db_connection = None
+
+_last_rapl_uj = None
+_last_rapl_time = None
+
+# Serves as our working state manager
+_internal_metrics = {
+    "status": "online",
+    "server_uptime_seconds": 0,
+    "cpu": {
+        "model_name": "Unknown Processor",
+        "usage_percent": 0.0,
+        "cores_physical": 0,
+        "cores_logical": 0,
+        "temp_celsius": "N/A"
+    },
+    "ram": {
+        "usage_percent": 0.0,
+        "used_gb": 0.0,
+        "total_gb": 0.0
+    },
+    "gpu": {
+        "available": False,
+        "devices": []
+    },
+    "energy": {
+        "current_total_watts": 0.0,
+        "lifetime_cumulative_kwh": 0.0,
+        "lifetime_cumulative_cost": 0.0,
+        "current_month_kwh": 0.0,
+        "current_month_cost": 0.0
+    },
+    "tokens": {
+        "prompt": 0,
+        "generation": 0
+    }
+}
+
+# The true read-only public mirror cache (Provides 100% thread safety)
+_public_stats_cache = copy.deepcopy(_internal_metrics)
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS energy_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cumulative_kwh REAL DEFAULT 0.0,
+                cumulative_cost REAL DEFAULT 0.0,
+                month_cumulative_kwh REAL DEFAULT 0.0,
+                month_cumulative_cost REAL DEFAULT 0.0,
+                current_month_integer INTEGER,
+                last_updated REAL
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS token_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt_tokens INTEGER DEFAULT 0,
+                generation_tokens INTEGER DEFAULT 0,
+                last_updated REAL
+            )
+        ''')
+
+        
+        cursor.execute("PRAGMA table_info(energy_metrics)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "month_cumulative_kwh" not in columns:
+            cursor.execute("ALTER TABLE energy_metrics ADD COLUMN month_cumulative_kwh REAL DEFAULT 0.0")
+            cursor.execute("ALTER TABLE energy_metrics ADD COLUMN month_cumulative_cost REAL DEFAULT 0.0")
+            cursor.execute("ALTER TABLE energy_metrics ADD COLUMN current_month_integer INTEGER")
+            
+        cursor.execute("SELECT COUNT(*) FROM energy_metrics")
+        if cursor.fetchone()[0] == 0:
+            current_month = time.localtime().tm_mon
+            cursor.execute('''
+                INSERT INTO energy_metrics 
+                (cumulative_kwh, cumulative_cost, month_cumulative_kwh, month_cumulative_cost, current_month_integer, last_updated) 
+                VALUES (0.0, 0.0, 0.0, 0.0, ?, ?)
+            ''', (current_month, time.time()))
+        conn.commit()
+
+@app.on_event("startup")
+async def startup_event():
+    global db_connection
+    init_db()
+    
+    # Establish single persistent connection object
+    db_connection = sqlite3.connect(DB_PATH, check_same_thread=False)
+    
+    _internal_metrics["cpu"]["model_name"] = get_cpu_model_name()
+    _internal_metrics["cpu"]["cores_physical"] = psutil.cpu_count(logical=False)
+    _internal_metrics["cpu"]["cores_logical"] = psutil.cpu_count(logical=True)
+    _internal_metrics["gpu"]["available"] = HAS_NVIDIA
+    
+    update_energy_cache_from_db()
+    update_token_cache_from_db()
+    psutil.cpu_percent(interval=None)
+    
+    asyncio.create_task(metrics_collection_worker())
+
+@app.on_event("shutdown")
+def shutdown_event():
+    global db_connection
+    if db_connection:
+        db_connection.close()
+    if HAS_NVIDIA:
+        try:
+            from pynvml import nvmlShutdown
+            nvmlShutdown() # Clean driver teardown preventing orphaned memory states
+        except Exception:
+            pass
+
+def update_energy_cache_from_db():
+    cursor = db_connection.cursor()
+    cursor.execute('''
+        SELECT cumulative_kwh, cumulative_cost, month_cumulative_kwh, month_cumulative_cost 
+        FROM energy_metrics WHERE id = 1
+    ''')
+    row = cursor.fetchone()
+    if row:
+        _internal_metrics["energy"]["lifetime_cumulative_kwh"] = round(row[0], 4)
+        _internal_metrics["energy"]["lifetime_cumulative_cost"] = round(row[1], 2)
+        _internal_metrics["energy"]["current_month_kwh"] = round(row[2], 4)
+        _internal_metrics["energy"]["current_month_cost"] = round(row[3], 2)
+
+def update_token_cache_from_db():
+    cursor = db_connection.cursor()
+    cursor.execute('SELECT prompt_tokens, generation_tokens FROM token_metrics WHERE id = 1')
+    row = cursor.fetchone()
+    if row:
+        _internal_metrics["tokens"]["prompt"] = row[0]
+        _internal_metrics["tokens"]["generation"] = row[1]
+
+def get_cpu_rapl_watts_nonblocking() -> float | None:
+    global _last_rapl_uj, _last_rapl_time
+    try:
+        path = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                current_uj = int(f.read().strip())
+            current_time = time.time()
+            
+            if _last_rapl_uj is not None and _last_rapl_time is not None:
+                time_delta = current_time - _last_rapl_time
+                uj_delta = current_uj - _last_rapl_uj
+                
+                if uj_delta >= 0 and time_delta > 0:
+                    watts = (uj_delta / 1000000.0) / time_delta
+                    if 0 < watts < 500:
+                        _last_rapl_uj = current_uj
+                        _last_rapl_time = current_time
+                        return watts
+            
+            _last_rapl_uj = current_uj
+            _last_rapl_time = current_time
+    except Exception:
+        pass
+    return None
+
+def get_estimated_cpu_watts(cpu_percent: float) -> float:
+    idle_floor = 25.0
+    peak_ceiling = 140.0
+    return idle_floor + ((cpu_percent / 100.0) * (peak_ceiling - idle_floor))
+
+def update_vllm_token_metrics():
+    global _internal_metrics
+    try:
+        response = requests.get(VLLM_METRICS_URL, timeout=2)
+        if response.status_code == 200:
+            content = response.text
+            
+            # vLLM prometheus metrics for tokens
+            prompt_match = re.search(r'vllm:prompt_tokens_sum\s+([\d.]+)', content)
+            gen_match = re.search(r'vllm:generation_tokens_sum\s+([\d.]+)', content)
+            
+            if prompt_match and gen_match:
+                prompt_tokens = int(float(prompt_match.group(1)))
+                gen_tokens = int(float(gen_match.group(1)))
+                
+                _internal_metrics["tokens"]["prompt"] = prompt_tokens
+                _internal_metrics["tokens"]["generation"] = gen_tokens
+                
+                # Persist to DB
+                cursor = db_connection.cursor()
+                cursor.execute('''
+                    INSERT INTO token_metrics (id, prompt_tokens, generation_tokens, last_updated)
+                    VALUES (1, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET 
+                        prompt_tokens=excluded.prompt_tokens, 
+                        generation_tokens=excluded.generation_tokens, 
+                        last_updated=excluded.last_updated
+                ''', (prompt_tokens, gen_tokens, time.time()))
+                db_connection.commit()
+    except Exception as e:
+        # Silently fail to avoid crashing the main telemetry loop
+        pass
+
+def collect_all_system_metrics():
+    global _public_stats_cache
+    
+    cpu_percent = psutil.cpu_percent(interval=None)
+    ram = psutil.virtual_memory()
+    
+    cpu_temp = "N/A"
+    try:
+        temps = psutil.sensors_temperatures()
+        for label in ["k10temp", "zenpower", "coretemp", "cpu_thermal"]:
+            if label in temps and temps[label]:
+                cpu_temp = round(temps[label][0].current)
+                break
+    except Exception:
+        pass
+
+    _internal_metrics["server_uptime_seconds"] = int(time.time() - SERVER_START_TIME)
+    _internal_metrics["cpu"]["usage_percent"] = cpu_percent
+    _internal_metrics["cpu"]["temp_celsius"] = cpu_temp
+    _internal_metrics["ram"]["usage_percent"] = ram.percent
+    _internal_metrics["ram"]["used_gb"] = round(ram.used / (1024**3), 2)
+    _internal_metrics["ram"]["total_gb"] = round(ram.total / (1024**3), 2)
+    
+    gpu_watts = 0.0
+    if HAS_NVIDIA:
+        try:
+            device_count = nvmlDeviceGetCount()
+            gpus = []
+            for i in range(device_count):
+                handle = nvmlDeviceGetHandleByIndex(i)
+                util = nvmlDeviceGetUtilizationRates(handle)
+                power = nvmlDeviceGetPowerUsage(handle)
+                temp = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
+                mem = nvmlDeviceGetMemoryInfo(handle) 
+
+                raw_name = nvmlDeviceGetName(handle)
+                model_name = raw_name.decode('utf-8') if isinstance(raw_name, bytes) else raw_name
+                
+                gpus.append({
+                    "index": i,
+                    "model_name": model_name,
+                    "usage_percent": util.gpu,
+                    "power_watts": round(power / 1000.0, 2),
+                    "temp_celsius": temp,
+                    "vram_used_gb": round(mem.used / (1024**3), 2),
+                    "vram_total_gb": round(mem.total / (1024**3), 2),
+                    "vram_percent": round((mem.used / mem.total) * 100, 1)
+                })
+                gpu_watts += round(power / 1000.0, 2)
+            
+            _internal_metrics["gpu"]["available"] = True
+            _internal_metrics["gpu"]["devices"] = gpus
+        except Exception as e:
+            _internal_metrics["gpu"]["error"] = str(e)
+            
+    cpu_watts = get_cpu_rapl_watts_nonblocking()
+    if cpu_watts is None:
+        cpu_watts = get_estimated_cpu_watts(cpu_percent)
+        
+    system_overhead_watts = 50.0
+    total_watts = gpu_watts + cpu_watts + system_overhead_watts
+    _internal_metrics["energy"]["current_total_watts"] = round(total_watts, 1)
+
+    now = time.time()
+    active_month = time.localtime(now).tm_mon
+
+    cursor = db_connection.cursor()
+    cursor.execute('''
+        SELECT cumulative_kwh, cumulative_cost, month_cumulative_kwh, month_cumulative_cost, current_month_integer, last_updated 
+        FROM energy_metrics WHERE id = 1
+    ''')
+    lt_kwh, lt_cost, mo_kwh, mo_cost, stored_month, last_updated = cursor.fetchone()
+
+    if stored_month is None or active_month != stored_month:
+        mo_kwh = 0.0
+        mo_cost = 0.0
+        stored_month = active_month
+
+    time_delta_hours = (now - last_updated) / 3600.0
+    
+    if time_delta_hours > 0:
+        incremental_kwh = (total_watts * time_delta_hours) / 1000.0
+        incremental_cost = incremental_kwh * ELECTRICITY_RATE_PER_KWH
+
+        lt_kwh += incremental_kwh
+        lt_cost += incremental_cost
+        mo_kwh += incremental_kwh
+        mo_cost += incremental_cost
+
+        cursor.execute('''
+            UPDATE energy_metrics 
+            SET cumulative_kwh = ?, cumulative_cost = ?, 
+                month_cumulative_kwh = ?, month_cumulative_cost = ?, 
+                current_month_integer = ?, last_updated = ? 
+            WHERE id = 1
+        ''', (lt_kwh, lt_cost, mo_kwh, mo_cost, stored_month, now))
+        db_connection.commit()
+
+        _internal_metrics["energy"]["lifetime_cumulative_kwh"] = round(lt_kwh, 4)
+        _internal_metrics["energy"]["lifetime_cumulative_cost"] = round(lt_cost, 2)
+        _internal_metrics["energy"]["current_month_kwh"] = round(mo_kwh, 4)
+        _internal_metrics["energy"]["current_month_cost"] = round(mo_cost, 2)
+
+    # Atomic swap assignment: Creates an isolated point-in-time state for API consumers
+    _public_stats_cache = copy.deepcopy(_internal_metrics)
+
+async def metrics_collection_worker():
+    while True:
+        try:
+            # Update tokens first, then system stats
+            await asyncio.to_thread(update_vllm_token_metrics)
+            await asyncio.to_thread(collect_all_system_metrics)
+        except Exception as e:
+            print(f"Error executing background telemetry loop: {e}")
+        await asyncio.sleep(BACKGROUND_INTERVAL_SECONDS)
+
+def get_api_key(header_value: str = Security(api_key_header)):
+    if REQUIRE_AUTH and header_value != API_KEY:
+        raise HTTPException(status_code=403, detail="Could not validate credentials")
+    return header_value
+
+def get_cpu_model_name():
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if "model name" in line:
+                    return line.split(":")[1].strip()
+    except Exception:
+        pass
+    return "Unknown Processor"
+
+try:
+    from pynvml import (
+        nvmlInit, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates,
+        nvmlDeviceGetPowerUsage, nvmlDeviceGetName, nvmlDeviceGetTemperature,
+        nvmlDeviceGetMemoryInfo, NVML_TEMPERATURE_GPU
+    )
+    nvmlInit()
+    HAS_NVIDIA = True
+except Exception:
+    HAS_NVIDIA = False
+
+@app.get("/stats", dependencies=[Security(get_api_key)])
+def get_stats():
+    # Serves the safe cloned version instantly
+    return _public_stats_cache
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
