@@ -1,4 +1,6 @@
 import os
+import logging
+import secrets
 import psutil
 import time
 import sqlite3
@@ -12,15 +14,45 @@ from fastapi.security import APIKeyHeader
 SERVER_START_TIME = time.time()
 app = FastAPI(title="Advanced Server Stats API")
 
-REQUIRE_AUTH = False
-API_KEY = "your_super_secret_token_here"
+log = logging.getLogger("server-stats")
+
+TOKEN_PATH = os.getenv("STATS_TOKEN_FILE") or os.path.join(
+    os.path.expanduser("~"), ".config", "server-stats", "token"
+)
+
+
+def _load_or_create_token() -> str:
+    """Read the API token, generating a 0600 one on first run."""
+    try:
+        with open(TOKEN_PATH) as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except FileNotFoundError:
+        pass
+    tok = secrets.token_urlsafe(24)
+    os.makedirs(os.path.dirname(TOKEN_PATH), mode=0o700, exist_ok=True)
+    fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(tok + "\n")
+    log.warning("generated new API token at %s", TOKEN_PATH)
+    return tok
+
+
+REQUIRE_AUTH = os.getenv("STATS_REQUIRE_AUTH", "1").lower() not in ("0", "false", "no")
+API_KEY = _load_or_create_token()
 API_KEY_NAME = "X-Server-Token"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "power_tracker.db")
 ELECTRICITY_RATE_PER_KWH = 0.13  
 BACKGROUND_INTERVAL_SECONDS = 5  
-VLLM_METRICS_URL = "http://localhost:8000/metrics"
+# Opt-in only. The vLLM gateway launches backends on dynamic ports, so there is
+# no fixed URL to scrape; prefer the gateway's own telemetry. Set explicitly to
+# re-enable against a known backend.
+# The vLLM gateway aggregates whatever backends are live; scraping a
+# backend port directly is unreliable since they only exist while loaded.
+VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL") or "http://127.0.0.1:8080/metrics"
 
 
 # Global persistent database connection reference
@@ -192,14 +224,16 @@ def get_estimated_cpu_watts(cpu_percent: float) -> float:
 
 def update_vllm_token_metrics():
     global _internal_metrics
+    if not VLLM_METRICS_URL:
+        return
     try:
         response = requests.get(VLLM_METRICS_URL, timeout=2)
         if response.status_code == 200:
             content = response.text
             
             # vLLM prometheus metrics for tokens
-            prompt_match = re.search(r'vllm:prompt_tokens_sum\s+([\d.]+)', content)
-            gen_match = re.search(r'vllm:generation_tokens_sum\s+([\d.]+)', content)
+            prompt_match = re.search(r'vllm:prompt_tokens_(?:sum|total)\s+([\d.]+)', content)
+            gen_match = re.search(r'vllm:generation_tokens_(?:sum|total)\s+([\d.]+)', content)
             
             if prompt_match and gen_match:
                 prompt_tokens = int(float(prompt_match.group(1)))
@@ -220,8 +254,8 @@ def update_vllm_token_metrics():
                 ''', (prompt_tokens, gen_tokens, time.time()))
                 db_connection.commit()
     except Exception as e:
-        # Silently fail to avoid crashing the main telemetry loop
-        pass
+        # Never crash the telemetry loop, but do not fail invisibly either.
+        log.debug("vLLM metrics scrape failed (%s): %s", VLLM_METRICS_URL, e)
 
 def collect_all_system_metrics():
     global _public_stats_cache
@@ -340,7 +374,7 @@ async def metrics_collection_worker():
         await asyncio.sleep(BACKGROUND_INTERVAL_SECONDS)
 
 def get_api_key(header_value: str = Security(api_key_header)):
-    if REQUIRE_AUTH and header_value != API_KEY:
+    if REQUIRE_AUTH and not secrets.compare_digest(header_value or "", API_KEY):
         raise HTTPException(status_code=403, detail="Could not validate credentials")
     return header_value
 
