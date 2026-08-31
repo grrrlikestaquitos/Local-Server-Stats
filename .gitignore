@@ -1,0 +1,13 @@
+# Virtualenv - not portable, hardcodes absolute paths
+venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Runtime state, not source
+power_tracker.db
+*.db
+
+# Local backups
+*.bak
