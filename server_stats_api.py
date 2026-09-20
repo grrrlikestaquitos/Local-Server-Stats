@@ -122,6 +122,19 @@ def init_db():
         ''')
 
         
+        # Per-backend high-water marks. The gateway's aggregate is a sum over
+        # *currently loaded* backends, so it drops when one unloads and restarts
+        # at zero when one reloads. Tracking each backend separately lets us
+        # accumulate real deltas instead of trusting a non-monotonic total.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS token_backend_state (
+                backend TEXT PRIMARY KEY,
+                last_prompt REAL DEFAULT 0.0,
+                last_generation REAL DEFAULT 0.0,
+                last_seen REAL
+            )
+        ''')
+
         cursor.execute("PRAGMA table_info(energy_metrics)")
         columns = [col[1] for col in cursor.fetchall()]
         if "month_cumulative_kwh" not in columns:
@@ -222,37 +235,98 @@ def get_estimated_cpu_watts(cpu_percent: float) -> float:
     peak_ceiling = 140.0
     return idle_floor + ((cpu_percent / 100.0) * (peak_ceiling - idle_floor))
 
+_BACKEND_SPLIT_RE = re.compile(r'^# backend (\S+).*$', re.M)
+_PROMPT_TOTAL_RE = re.compile(r'^vllm:prompt_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)', re.M)
+_GEN_TOTAL_RE = re.compile(r'^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)', re.M)
+_PROMPT_SUM_RE = re.compile(r'^vllm:prompt_tokens_sum\s+([\d.eE+-]+)', re.M)
+_GEN_SUM_RE = re.compile(r'^vllm:generation_tokens_sum\s+([\d.eE+-]+)', re.M)
+
+
+def _sum_floats(pattern, text):
+    total = 0.0
+    for m in pattern.findall(text):
+        try:
+            total += float(m)
+        except ValueError:
+            pass
+    return total
+
+
+def parse_backend_tokens(text):
+    """Map backend id -> (prompt, generation) from the gateway's /metrics.
+
+    The gateway emits one `# backend <model_id>` chunk per live backend, then an
+    aggregate. We prefer the per-backend chunks because each one is genuinely
+    monotonic for as long as that backend lives. The aggregate is only a
+    fallback for when nothing is loaded (or an older gateway), and is keyed
+    separately so it can never be mistaken for a real backend.
+    """
+    parts = _BACKEND_SPLIT_RE.split(text)
+    out = {}
+    if len(parts) > 1:
+        # parts == [preamble, id1, body1, id2, body2, ...]
+        for i in range(1, len(parts) - 1, 2):
+            body = parts[i + 1]
+            out[parts[i]] = (_sum_floats(_PROMPT_TOTAL_RE, body),
+                             _sum_floats(_GEN_TOTAL_RE, body))
+    if out:
+        return out
+    pm, gm = _PROMPT_SUM_RE.search(text), _GEN_SUM_RE.search(text)
+    if pm and gm:
+        return {"__aggregate__": (float(pm.group(1)), float(gm.group(1)))}
+    return {}
+
+
 def update_vllm_token_metrics():
     global _internal_metrics
     if not VLLM_METRICS_URL:
         return
     try:
         response = requests.get(VLLM_METRICS_URL, timeout=2)
-        if response.status_code == 200:
-            content = response.text
-            
-            # vLLM prometheus metrics for tokens
-            prompt_match = re.search(r'vllm:prompt_tokens_(?:sum|total)\s+([\d.]+)', content)
-            gen_match = re.search(r'vllm:generation_tokens_(?:sum|total)\s+([\d.]+)', content)
-            
-            if prompt_match and gen_match:
-                prompt_tokens = int(float(prompt_match.group(1)))
-                gen_tokens = int(float(gen_match.group(1)))
-                
-                _internal_metrics["tokens"]["prompt"] = prompt_tokens
-                _internal_metrics["tokens"]["generation"] = gen_tokens
-                
-                # Persist to DB
-                cursor = db_connection.cursor()
-                cursor.execute('''
-                    INSERT INTO token_metrics (id, prompt_tokens, generation_tokens, last_updated)
-                    VALUES (1, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET 
-                        prompt_tokens=excluded.prompt_tokens, 
-                        generation_tokens=excluded.generation_tokens, 
-                        last_updated=excluded.last_updated
-                ''', (prompt_tokens, gen_tokens, time.time()))
-                db_connection.commit()
+        if response.status_code != 200:
+            return
+        current = parse_backend_tokens(response.text)
+        if not current:
+            return
+
+        cursor = db_connection.cursor()
+        cursor.execute('SELECT backend, last_prompt, last_generation FROM token_backend_state')
+        previous = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+        delta_prompt = delta_gen = 0.0
+        now = time.time()
+        for backend, (prompt, gen) in current.items():
+            last_prompt, last_gen = previous.get(backend, (0.0, 0.0))
+            # A reload restarts the backend's counter at zero, so a decrease
+            # means "restarted", not "negative usage" - count the new value
+            # whole rather than differencing against a stale high-water mark.
+            delta_prompt += (prompt - last_prompt) if prompt >= last_prompt else prompt
+            delta_gen += (gen - last_gen) if gen >= last_gen else gen
+            cursor.execute('''
+                INSERT INTO token_backend_state (backend, last_prompt, last_generation, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(backend) DO UPDATE SET
+                    last_prompt=excluded.last_prompt,
+                    last_generation=excluded.last_generation,
+                    last_seen=excluded.last_seen
+            ''', (backend, prompt, gen, now))
+
+        # Rows for vanished backends are deliberately kept: the lifetime total
+        # already includes their tokens, and the high-water mark is what lets a
+        # later reload be recognised as a restart.
+        if delta_prompt or delta_gen:
+            _internal_metrics["tokens"]["prompt"] += int(delta_prompt)
+            _internal_metrics["tokens"]["generation"] += int(delta_gen)
+            cursor.execute('''
+                INSERT INTO token_metrics (id, prompt_tokens, generation_tokens, last_updated)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    prompt_tokens=excluded.prompt_tokens,
+                    generation_tokens=excluded.generation_tokens,
+                    last_updated=excluded.last_updated
+            ''', (_internal_metrics["tokens"]["prompt"],
+                   _internal_metrics["tokens"]["generation"], now))
+        db_connection.commit()
     except Exception as e:
         # Never crash the telemetry loop, but do not fail invisibly either.
         log.debug("vLLM metrics scrape failed (%s): %s", VLLM_METRICS_URL, e)
