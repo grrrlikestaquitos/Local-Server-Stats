@@ -45,7 +45,6 @@ API_KEY_NAME = "X-Server-Token"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "power_tracker.db")
-ELECTRICITY_RATE_PER_KWH = 0.13  
 BACKGROUND_INTERVAL_SECONDS = 5  
 # Opt-in only. The vLLM gateway launches backends on dynamic ports, so there is
 # no fixed URL to scrape; prefer the gateway's own telemetry. Set explicitly to
@@ -58,12 +57,11 @@ VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL") or "http://127.0.0.1:8080/metri
 # Global persistent database connection reference
 db_connection = None
 
-_last_rapl_uj = None
-_last_rapl_time = None
-
 # Serves as our working state manager
 _internal_metrics = {
     "status": "online",
+    # Seconds since the epoch at which the loop finished collecting the figures below.
+    "sampled_at": None,
     "server_uptime_seconds": 0,
     "cpu": {
         "model_name": "Unknown Processor",
@@ -81,13 +79,6 @@ _internal_metrics = {
         "available": False,
         "devices": []
     },
-    "energy": {
-        "current_total_watts": 0.0,
-        "lifetime_cumulative_kwh": 0.0,
-        "lifetime_cumulative_cost": 0.0,
-        "current_month_kwh": 0.0,
-        "current_month_cost": 0.0
-    },
     "tokens": {
         "prompt": 0,
         "generation": 0
@@ -100,18 +91,6 @@ _public_stats_cache = copy.deepcopy(_internal_metrics)
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS energy_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cumulative_kwh REAL DEFAULT 0.0,
-                cumulative_cost REAL DEFAULT 0.0,
-                month_cumulative_kwh REAL DEFAULT 0.0,
-                month_cumulative_cost REAL DEFAULT 0.0,
-                current_month_integer INTEGER,
-                last_updated REAL
-            )
-        ''')
-
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS token_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,21 +114,6 @@ def init_db():
             )
         ''')
 
-        cursor.execute("PRAGMA table_info(energy_metrics)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if "month_cumulative_kwh" not in columns:
-            cursor.execute("ALTER TABLE energy_metrics ADD COLUMN month_cumulative_kwh REAL DEFAULT 0.0")
-            cursor.execute("ALTER TABLE energy_metrics ADD COLUMN month_cumulative_cost REAL DEFAULT 0.0")
-            cursor.execute("ALTER TABLE energy_metrics ADD COLUMN current_month_integer INTEGER")
-            
-        cursor.execute("SELECT COUNT(*) FROM energy_metrics")
-        if cursor.fetchone()[0] == 0:
-            current_month = time.localtime().tm_mon
-            cursor.execute('''
-                INSERT INTO energy_metrics 
-                (cumulative_kwh, cumulative_cost, month_cumulative_kwh, month_cumulative_cost, current_month_integer, last_updated) 
-                VALUES (0.0, 0.0, 0.0, 0.0, ?, ?)
-            ''', (current_month, time.time()))
         conn.commit()
 
 @app.on_event("startup")
@@ -165,7 +129,6 @@ async def startup_event():
     _internal_metrics["cpu"]["cores_logical"] = psutil.cpu_count(logical=True)
     _internal_metrics["gpu"]["available"] = HAS_NVIDIA
     
-    update_energy_cache_from_db()
     update_token_cache_from_db()
     psutil.cpu_percent(interval=None)
     
@@ -183,19 +146,6 @@ def shutdown_event():
         except Exception:
             pass
 
-def update_energy_cache_from_db():
-    cursor = db_connection.cursor()
-    cursor.execute('''
-        SELECT cumulative_kwh, cumulative_cost, month_cumulative_kwh, month_cumulative_cost 
-        FROM energy_metrics WHERE id = 1
-    ''')
-    row = cursor.fetchone()
-    if row:
-        _internal_metrics["energy"]["lifetime_cumulative_kwh"] = round(row[0], 4)
-        _internal_metrics["energy"]["lifetime_cumulative_cost"] = round(row[1], 2)
-        _internal_metrics["energy"]["current_month_kwh"] = round(row[2], 4)
-        _internal_metrics["energy"]["current_month_cost"] = round(row[3], 2)
-
 def update_token_cache_from_db():
     cursor = db_connection.cursor()
     cursor.execute('SELECT prompt_tokens, generation_tokens FROM token_metrics WHERE id = 1')
@@ -203,37 +153,6 @@ def update_token_cache_from_db():
     if row:
         _internal_metrics["tokens"]["prompt"] = row[0]
         _internal_metrics["tokens"]["generation"] = row[1]
-
-def get_cpu_rapl_watts_nonblocking() -> float | None:
-    global _last_rapl_uj, _last_rapl_time
-    try:
-        path = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                current_uj = int(f.read().strip())
-            current_time = time.time()
-            
-            if _last_rapl_uj is not None and _last_rapl_time is not None:
-                time_delta = current_time - _last_rapl_time
-                uj_delta = current_uj - _last_rapl_uj
-                
-                if uj_delta >= 0 and time_delta > 0:
-                    watts = (uj_delta / 1000000.0) / time_delta
-                    if 0 < watts < 500:
-                        _last_rapl_uj = current_uj
-                        _last_rapl_time = current_time
-                        return watts
-            
-            _last_rapl_uj = current_uj
-            _last_rapl_time = current_time
-    except Exception:
-        pass
-    return None
-
-def get_estimated_cpu_watts(cpu_percent: float) -> float:
-    idle_floor = 25.0
-    peak_ceiling = 140.0
-    return idle_floor + ((cpu_percent / 100.0) * (peak_ceiling - idle_floor))
 
 _BACKEND_SPLIT_RE = re.compile(r'^# backend (\S+).*$', re.M)
 _PROMPT_TOTAL_RE = re.compile(r'^vllm:prompt_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)', re.M)
@@ -354,7 +273,6 @@ def collect_all_system_metrics():
     _internal_metrics["ram"]["used_gb"] = round(ram.used / (1024**3), 2)
     _internal_metrics["ram"]["total_gb"] = round(ram.total / (1024**3), 2)
     
-    gpu_watts = 0.0
     if HAS_NVIDIA:
         try:
             device_count = nvmlDeviceGetCount()
@@ -379,60 +297,13 @@ def collect_all_system_metrics():
                     "vram_total_gb": round(mem.total / (1024**3), 2),
                     "vram_percent": round((mem.used / mem.total) * 100, 1)
                 })
-                gpu_watts += round(power / 1000.0, 2)
             
             _internal_metrics["gpu"]["available"] = True
             _internal_metrics["gpu"]["devices"] = gpus
         except Exception as e:
             _internal_metrics["gpu"]["error"] = str(e)
             
-    cpu_watts = get_cpu_rapl_watts_nonblocking()
-    if cpu_watts is None:
-        cpu_watts = get_estimated_cpu_watts(cpu_percent)
-        
-    system_overhead_watts = 50.0
-    total_watts = gpu_watts + cpu_watts + system_overhead_watts
-    _internal_metrics["energy"]["current_total_watts"] = round(total_watts, 1)
-
-    now = time.time()
-    active_month = time.localtime(now).tm_mon
-
-    cursor = db_connection.cursor()
-    cursor.execute('''
-        SELECT cumulative_kwh, cumulative_cost, month_cumulative_kwh, month_cumulative_cost, current_month_integer, last_updated 
-        FROM energy_metrics WHERE id = 1
-    ''')
-    lt_kwh, lt_cost, mo_kwh, mo_cost, stored_month, last_updated = cursor.fetchone()
-
-    if stored_month is None or active_month != stored_month:
-        mo_kwh = 0.0
-        mo_cost = 0.0
-        stored_month = active_month
-
-    time_delta_hours = (now - last_updated) / 3600.0
-    
-    if time_delta_hours > 0:
-        incremental_kwh = (total_watts * time_delta_hours) / 1000.0
-        incremental_cost = incremental_kwh * ELECTRICITY_RATE_PER_KWH
-
-        lt_kwh += incremental_kwh
-        lt_cost += incremental_cost
-        mo_kwh += incremental_kwh
-        mo_cost += incremental_cost
-
-        cursor.execute('''
-            UPDATE energy_metrics 
-            SET cumulative_kwh = ?, cumulative_cost = ?, 
-                month_cumulative_kwh = ?, month_cumulative_cost = ?, 
-                current_month_integer = ?, last_updated = ? 
-            WHERE id = 1
-        ''', (lt_kwh, lt_cost, mo_kwh, mo_cost, stored_month, now))
-        db_connection.commit()
-
-        _internal_metrics["energy"]["lifetime_cumulative_kwh"] = round(lt_kwh, 4)
-        _internal_metrics["energy"]["lifetime_cumulative_cost"] = round(lt_cost, 2)
-        _internal_metrics["energy"]["current_month_kwh"] = round(mo_kwh, 4)
-        _internal_metrics["energy"]["current_month_cost"] = round(mo_cost, 2)
+    _internal_metrics["sampled_at"] = time.time()
 
     # Atomic swap assignment: Creates an isolated point-in-time state for API consumers
     _public_stats_cache = copy.deepcopy(_internal_metrics)
